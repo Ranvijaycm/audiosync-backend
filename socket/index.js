@@ -143,6 +143,35 @@ module.exports = function initSocket(io) {
       console.log(`🎵 Track available in room ${code}: ${trackName}`);
     });
 
+    // ── get-queue ─────────────────────────────────────────────────────────
+    // Listener requests existing queue when joining a room that already has tracks
+    socket.on('get-queue', async ({ roomCode }) => {
+      const code = roomCode?.toUpperCase();
+      if (!code) return;
+
+      try {
+        const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+
+        const [rooms] = await db.query('SELECT id FROM rooms WHERE code = ?', [code]);
+        if (!rooms.length) return;
+
+        const [tracks] = await db.query(
+          'SELECT id as trackId, track_name as trackName, artist, added_by as addedBy, file_path as fileUrl FROM queue WHERE room_id = ? AND is_played = FALSE ORDER BY order_index ASC',
+          [rooms[0].id]
+        );
+
+        const formattedTracks = tracks.map(t => ({
+          ...t,
+          fileUrl: `${baseUrl}/${t.fileUrl}`,
+        }));
+
+        socket.emit('queue-state', { tracks: formattedTracks });
+        console.log(`📋 Sent queue to ${socket.id} for room ${code}: ${formattedTracks.length} track(s)`);
+      } catch (err) {
+        console.error('get-queue error:', err);
+      }
+    });
+
     // ── device-ready ──────────────────────────────────────────────────────
     // Listener signals it has finished downloading the track
     socket.on('device-ready', ({ roomCode, userId }) => {
@@ -183,7 +212,6 @@ module.exports = function initSocket(io) {
           state.readyDevices.clear();
           state.countdownActive = false;
 
-          const [rooms] = await db.query('SELECT id FROM rooms WHERE code = ?', [code]);
           const baseUrl = `${process.env.BASE_URL || 'http://localhost:' + (process.env.PORT || 3000)}`;
           const fileUrl = `${baseUrl}/${nextTrack.file_path}`;
 
