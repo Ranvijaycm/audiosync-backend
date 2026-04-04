@@ -149,23 +149,26 @@ module.exports = function initSocket(io) {
 
     // ── track-uploaded ────────────────────────────────────────────────────
     socket.on('track-uploaded', ({ roomCode, trackId, fileUrl, trackName, artist, addedBy }) => {
-      const code = roomCode?.toUpperCase();
-      if (!code) return;
+    const code = roomCode?.toUpperCase();
+    if (!code) return;
 
-      const state = getRoomState(code);
+    const state = getRoomState(code);
 
-      // FIX 3: Only set currentTrackId + clear readyDevices if nothing is playing.
-      // Before, this always cleared readyDevices, breaking queued tracks.
-      if (!state.currentTrackId) {
+    // Only set as current track if nothing is playing
+    if (!state.currentTrackId) {
         state.currentTrackId = trackId;
         state.readyDevices.clear();
         state.countdownActive = false;
         state.trackEndedProcessed = false;
-      }
+        // Broadcast to trigger download + ready flow
+        io.to(code).emit('track-available', { trackId, fileUrl, trackName, artist, addedBy });
+    } else {
+        // Something already playing — just add to queue UI, don't interrupt
+        io.to(code).emit('track-queued', { trackId, fileUrl, trackName, artist, addedBy });
+    }
 
-      io.to(code).emit('track-available', { trackId, fileUrl, trackName, artist, addedBy });
-      console.log(`🎵 Track available in room ${code}: ${trackName} (id=${trackId})`);
-    });
+    console.log(`🎵 Track uploaded in room ${code}: ${trackName} (id=${trackId})`);
+});
 
     // ── get-queue ─────────────────────────────────────────────────────────
     socket.on('get-queue', async ({ roomCode }) => {
