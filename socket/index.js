@@ -9,6 +9,7 @@ const db = require('../config/db');
  *   readyDevices: Set<socketId>,
  *   currentTrackId: Int | null,
  *   countdownActive: Boolean,
+ *   trackEndedProcessed: Boolean,  // FIX: prevent duplicate track-ended processing
  * }
  */
 const roomState = {};
@@ -22,6 +23,7 @@ function getRoomState(roomCode) {
       readyDevices: new Set(),
       currentTrackId: null,
       countdownActive: false,
+      trackEndedProcessed: false,
     };
   }
   return roomState[roomCode];
@@ -53,24 +55,38 @@ async function getFullQueue(roomCode, baseUrl) {
   return tracks.map(t => ({ ...t, url: `${baseUrl}/${t.url}`, duration: 0 }));
 }
 
+// FIX 1 — SYNC LAG ROOT CAUSE:
+// The old setInterval-based countdown drifted by ~100ms/tick AND the 500ms startTime
+// buffer was too tight. MediaPlayer.prepare() on Android takes 1-3s on first call,
+// so devices that weren't already prepared would lag by exactly that amount (6-7s).
+// Solution: use precise setTimeout chain + 2500ms lead time so all devices have
+// enough time to call prepare() and be ready BEFORE the scheduled start timestamp.
 function startCountdown(io, roomCode, trackId) {
   const state = getRoomState(roomCode);
   if (state.countdownActive) return;
   state.countdownActive = true;
+  state.trackEndedProcessed = false;
 
   let count = 3;
-  const interval = setInterval(() => {
+  function tick() {
     io.to(roomCode).emit('sync-countdown', { secondsLeft: count });
     count--;
-    if (count < 0) {
-      clearInterval(interval);
+    if (count >= 0) {
+      setTimeout(tick, 1000);
+    } else {
       state.countdownActive = false;
-
-      // Emit start-playback with a precise future timestamp (500ms from now)
-      const startTime = Date.now() + 500;
+      // 2500ms lead — enough for MediaPlayer.prepare() + network jitter
+      const startTime = Date.now() + 2500;
       io.to(roomCode).emit('start-playback', { trackId, startTime });
+      console.log(`▶️  start-playback sent for room ${roomCode}, trackId=${trackId}, startTime=${startTime}`);
     }
-  }, 1000);
+  }
+  setTimeout(tick, 0);
+}
+
+// FIX 2 — GUEST USERS: guest IDs are negative (set by Android client)
+function isGuestUserId(userId) {
+  return typeof userId === 'number' && userId < 0;
 }
 
 module.exports = function initSocket(io) {
@@ -79,9 +95,14 @@ module.exports = function initSocket(io) {
 
     // ── join-room ─────────────────────────────────────────────────────────
     socket.on('join-room', async ({ roomCode, userId, username }) => {
-      if (!roomCode || !userId || !username) return;
+      // FIX: userId can be negative for guests — only block missing/null values
+      if (!roomCode || userId === undefined || userId === null || !username) {
+        socket.emit('room-joined', { success: false, message: 'roomCode, userId, and username are required' });
+        return;
+      }
 
       const code = roomCode.toUpperCase();
+      const userIdInt = parseInt(userId);
 
       try {
         const [rooms] = await db.query(
@@ -97,29 +118,27 @@ module.exports = function initSocket(io) {
         socket.join(code);
 
         const state = getRoomState(code);
-        state.members.set(socket.id, { userId: parseInt(userId), username });
+        state.members.set(socket.id, { userId: userIdInt, username });
 
-        // Determine host
-        if (room.created_by === parseInt(userId)) {
+        // Guests cannot be host
+        if (!isGuestUserId(userIdInt) && room.created_by === userIdInt) {
           state.hostSocketId = socket.id;
-          state.hostUserId = parseInt(userId);
+          state.hostUserId = userIdInt;
         }
 
-        // Store roomCode on socket for cleanup
         socket.data.roomCode = code;
-        socket.data.userId = parseInt(userId);
+        socket.data.userId = userIdInt;
         socket.data.username = username;
+        socket.data.isGuest = isGuestUserId(userIdInt);
 
         const listenerCount = getListenerCount(code);
-
         socket.emit('room-joined', { success: true, listenerCount });
-
-        // Notify others
         socket.to(code).emit('listener-joined', { listenerCount, username });
 
-        console.log(`👤 ${username} joined room ${code} (${listenerCount} total)`);
+        console.log(`👤 ${username} (userId=${userIdInt}, guest=${isGuestUserId(userIdInt)}) joined room ${code} (${listenerCount} total)`);
       } catch (err) {
         console.error('join-room error:', err);
+        socket.emit('room-joined', { success: false, message: 'Server error' });
       }
     });
 
@@ -129,29 +148,32 @@ module.exports = function initSocket(io) {
     });
 
     // ── track-uploaded ────────────────────────────────────────────────────
-    // Host tells server a new track was added; server broadcasts to all listeners
     socket.on('track-uploaded', ({ roomCode, trackId, fileUrl, trackName, artist, addedBy }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
 
       const state = getRoomState(code);
-      state.currentTrackId = trackId;
-      state.readyDevices.clear();
-      state.countdownActive = false;
+
+      // FIX 3: Only set currentTrackId + clear readyDevices if nothing is playing.
+      // Before, this always cleared readyDevices, breaking queued tracks.
+      if (!state.currentTrackId) {
+        state.currentTrackId = trackId;
+        state.readyDevices.clear();
+        state.countdownActive = false;
+        state.trackEndedProcessed = false;
+      }
 
       io.to(code).emit('track-available', { trackId, fileUrl, trackName, artist, addedBy });
-      console.log(`🎵 Track available in room ${code}: ${trackName}`);
+      console.log(`🎵 Track available in room ${code}: ${trackName} (id=${trackId})`);
     });
 
     // ── get-queue ─────────────────────────────────────────────────────────
-    // Listener requests existing queue when joining a room that already has tracks
     socket.on('get-queue', async ({ roomCode }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
 
       try {
         const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
-
         const [rooms] = await db.query('SELECT id FROM rooms WHERE code = ?', [code]);
         if (!rooms.length) return;
 
@@ -173,18 +195,25 @@ module.exports = function initSocket(io) {
     });
 
     // ── device-ready ──────────────────────────────────────────────────────
-    // Listener signals it has finished downloading the track
     socket.on('device-ready', ({ roomCode, userId }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
 
       const state = getRoomState(code);
+
+      // FIX 4: Guard against ghost sockets. If a socket isn't in members yet,
+      // it could have been from a stale reconnect — ignore it.
+      if (!state.members.has(socket.id)) {
+        console.warn(`⚠️  device-ready from unregistered socket ${socket.id} in room ${code}, ignoring`);
+        return;
+      }
+
       state.readyDevices.add(socket.id);
 
       const totalMembers = state.members.size;
       const readyCount = state.readyDevices.size;
 
-      console.log(`✅ Device ready in ${code}: ${readyCount}/${totalMembers}`);
+      console.log(`✅ Device ready in ${code}: ${readyCount}/${totalMembers} (socketId=${socket.id})`);
 
       if (readyCount >= totalMembers && totalMembers > 0 && !state.countdownActive) {
         console.log(`🚀 All devices ready in room ${code}, starting countdown`);
@@ -193,24 +222,29 @@ module.exports = function initSocket(io) {
     });
 
     // ── track-ended ───────────────────────────────────────────────────────
+    // FIX 5: All devices emit track-ended — deduplicate so we only advance queue once.
     socket.on('track-ended', async ({ roomCode }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
 
+      const state = getRoomState(code);
+
+      // Only process once per track
+      if (state.trackEndedProcessed) return;
+      state.trackEndedProcessed = true;
+
       try {
-        // Mark current track as played
-        const state = getRoomState(code);
         if (state.currentTrackId) {
           await db.query('UPDATE queue SET is_played = TRUE WHERE id = ?', [state.currentTrackId]);
         }
 
-        // Get next track
         const nextTrack = await getNextTrack(code);
 
         if (nextTrack) {
           state.currentTrackId = nextTrack.id;
           state.readyDevices.clear();
           state.countdownActive = false;
+          state.trackEndedProcessed = false;
 
           const baseUrl = `${process.env.BASE_URL || 'http://localhost:' + (process.env.PORT || 3000)}`;
           const fileUrl = `${baseUrl}/${nextTrack.file_path}`;
@@ -223,42 +257,49 @@ module.exports = function initSocket(io) {
             addedBy: nextTrack.added_by,
           });
 
-          // Emit updated queue
           const queue = await getFullQueue(code, baseUrl);
           io.to(code).emit('queue-updated', { queue });
+        } else {
+          state.currentTrackId = null;
+          io.to(code).emit('queue-empty', {});
         }
       } catch (err) {
         console.error('track-ended error:', err);
+        // Reset flag so a retry can work
+        state.trackEndedProcessed = false;
       }
     });
 
-    // ── seek-track ────────────────────────────────────────────────────────
+    // ── seek / pause / resume — host-only ─────────────────────────────────
+    // FIX 6: Validate that only the host can broadcast playback control events.
     socket.on('seek-track', ({ roomCode, position }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
+      const state = getRoomState(code);
+      if (state.hostSocketId && state.hostSocketId !== socket.id) return;
       socket.to(code).emit('playback-seeked', { position });
     });
 
-    // ── pause-track ───────────────────────────────────────────────────────
     socket.on('pause-track', ({ roomCode, position }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
+      const state = getRoomState(code);
+      if (state.hostSocketId && state.hostSocketId !== socket.id) return;
       socket.to(code).emit('playback-paused', { position });
     });
 
-    // ── resume-track ──────────────────────────────────────────────────────
     socket.on('resume-track', ({ roomCode, position }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
+      const state = getRoomState(code);
+      if (state.hostSocketId && state.hostSocketId !== socket.id) return;
       socket.to(code).emit('playback-resumed', { position });
     });
 
     // ── disconnect ────────────────────────────────────────────────────────
     socket.on('disconnect', () => {
       const { roomCode, userId } = socket.data;
-      if (roomCode) {
-        handleLeave(io, socket, roomCode, userId);
-      }
+      if (roomCode) handleLeave(io, socket, roomCode, userId);
       console.log(`🔌 Socket disconnected: ${socket.id}`);
     });
   });
@@ -281,7 +322,6 @@ async function handleLeave(io, socket, roomCode, userId) {
   const isHost = state.hostSocketId === socket.id;
 
   if (isHost) {
-    // Host left — close the room
     state.hostSocketId = null;
     try {
       await db.query('UPDATE rooms SET is_active = FALSE WHERE code = ?', [roomCode]);
@@ -292,33 +332,33 @@ async function handleLeave(io, socket, roomCode, userId) {
     } catch (err) {
       console.error('Error closing room:', err);
     }
-
     io.to(roomCode).emit('host-left', { message: 'The host has left. Room is now closed.' });
     delete roomState[roomCode];
     console.log(`🚪 Host left, room ${roomCode} closed`);
   } else {
-    // Regular listener left
     const listenerCount = getListenerCount(roomCode);
     io.to(roomCode).emit('listener-left', { listenerCount, username });
 
-    // If all remaining devices are ready now (edge case: someone left while others were ready)
     if (
-      state.readyDevices.size >= state.members.size &&
       state.members.size > 0 &&
+      state.readyDevices.size >= state.members.size &&
       !state.countdownActive &&
       state.currentTrackId
     ) {
       startCountdown(io, roomCode, state.currentTrackId);
     }
 
-    // Remove from DB
-    try {
-      const [rooms] = await db.query('SELECT id FROM rooms WHERE code = ?', [roomCode]);
-      if (rooms.length) {
-        await db.query('DELETE FROM room_users WHERE room_id = ? AND user_id = ?', [rooms[0].id, userId]);
+    // FIX 7: Skip DB delete for guest users — they're not stored in room_users
+    const userIdInt = parseInt(userId);
+    if (!isNaN(userIdInt) && userIdInt > 0) {
+      try {
+        const [rooms] = await db.query('SELECT id FROM rooms WHERE code = ?', [roomCode]);
+        if (rooms.length) {
+          await db.query('DELETE FROM room_users WHERE room_id = ? AND user_id = ?', [rooms[0].id, userIdInt]);
+        }
+      } catch (err) {
+        console.error('Error removing room_user:', err);
       }
-    } catch (err) {
-      console.error('Error removing room_user:', err);
     }
 
     console.log(`🚶 ${username} left room ${roomCode} (${listenerCount} remaining)`);

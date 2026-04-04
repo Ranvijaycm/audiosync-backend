@@ -17,13 +17,12 @@ async function generateRoomCode() {
   return code;
 }
 
-// Helper: count listeners in a room
 async function getListenerCount(roomId) {
   const [rows] = await db.query('SELECT COUNT(*) as count FROM room_users WHERE room_id = ?', [roomId]);
   return rows[0].count;
 }
 
-// POST /room/create
+// POST /room/create — logged-in users only
 router.post('/create', authMiddleware, async (req, res) => {
   const { userId } = req.body;
 
@@ -40,8 +39,6 @@ router.post('/create', authMiddleware, async (req, res) => {
     );
 
     const roomId = result.insertId;
-
-    // Add host to room_users
     await db.query('INSERT INTO room_users (room_id, user_id) VALUES (?, ?)', [roomId, userId]);
 
     const listenerCount = await getListenerCount(roomId);
@@ -59,7 +56,7 @@ router.post('/create', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /room/join
+// POST /room/join — logged-in users only
 router.post('/join', authMiddleware, async (req, res) => {
   const { roomCode, userId } = req.body;
 
@@ -79,7 +76,6 @@ router.post('/join', authMiddleware, async (req, res) => {
 
     const room = rooms[0];
 
-    // Add user to room (ignore duplicate)
     await db.query(
       'INSERT IGNORE INTO room_users (room_id, user_id) VALUES (?, ?)',
       [room.id, userId]
@@ -101,6 +97,40 @@ router.post('/join', authMiddleware, async (req, res) => {
   }
 });
 
+// FIX: POST /room/guest-join — guests don't have a JWT so they can't hit /join.
+// This endpoint only validates that the room exists — no DB record is written for guests.
+// All guest presence is tracked in-memory via socket state on the server.
+router.post('/guest-join', async (req, res) => {
+  const { roomCode } = req.body;
+
+  if (!roomCode) {
+    return res.status(400).json({ success: false, message: 'roomCode is required' });
+  }
+
+  try {
+    const [rooms] = await db.query(
+      'SELECT id, code, created_by FROM rooms WHERE code = ? AND is_active = TRUE',
+      [roomCode.toUpperCase()]
+    );
+
+    if (rooms.length === 0) {
+      return res.status(404).json({ success: false, message: 'Room not found or inactive' });
+    }
+
+    const room = rooms[0];
+
+    return res.json({
+      success: true,
+      roomCode: room.code,
+      isHost: false,
+      message: 'Guest joined room',
+    });
+  } catch (err) {
+    console.error('Guest join error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 // GET /room/:code
 router.get('/:code', authMiddleware, async (req, res) => {
   const { code } = req.params;
@@ -118,7 +148,6 @@ router.get('/:code', authMiddleware, async (req, res) => {
     const room = rooms[0];
     const listenerCount = await getListenerCount(room.id);
 
-    // Get queue for this room
     const [queueRows] = await db.query(
       `SELECT id, track_name as name, artist, added_by as addedBy, 
               file_path as url, order_index, is_played
@@ -126,12 +155,11 @@ router.get('/:code', authMiddleware, async (req, res) => {
       [room.id]
     );
 
-    // Build full URL for each track
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     const queue = queueRows.map(track => ({
       ...track,
       url: `${baseUrl}/${track.url}`,
-      duration: 0, // duration not stored; client can determine from file
+      duration: 0,
     }));
 
     return res.json({
@@ -146,7 +174,7 @@ router.get('/:code', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /room/queue/add  (multipart/form-data with audio file)
+// POST /room/queue/add — logged-in users only (guests cannot upload)
 router.post('/queue/add', authMiddleware, upload.single('audio'), async (req, res) => {
   const { roomCode, trackName, artist, addedBy } = req.body;
 
@@ -173,14 +201,12 @@ router.post('/queue/add', authMiddleware, upload.single('audio'), async (req, re
 
     const room = rooms[0];
 
-    // Determine next order index
     const [orderRows] = await db.query(
       'SELECT COALESCE(MAX(order_index), -1) + 1 AS next_index FROM queue WHERE room_id = ?',
       [room.id]
     );
     const orderIndex = orderRows[0].next_index;
 
-    // Relative file path for DB storage (also usable as URL path)
     const filePath = `uploads/${req.file.filename}`;
 
     const [result] = await db.query(
